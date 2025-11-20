@@ -5,6 +5,7 @@ import sys
 import csv
 import argparse
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Cargar variables de entorno desde el archivo.env
 load_dotenv()
@@ -24,6 +25,11 @@ SESSION.headers.update({
     "Content-Type": "application/json",
     "Arc-Priority": "ingestion",  # Header para contenido histórico/migrado
 })
+
+# Rate Limiting Global
+MAX_WORKERS = 10  # Número de hilos concurrentes
+REQUESTS_PER_MINUTE = 950  # Límite objetivo (un poco menos de 999 para margen)
+DELAY_PER_REQUEST = 60.0 / REQUESTS_PER_MINUTE  # Delay mínimo teórico entre requests globales
 
 
 def extract_site_from_filename(path):
@@ -61,6 +67,10 @@ def get_circulations(story_id):
     url = f"{DRAFT_API_BASE_URL}/story/{story_id}/circulation"
     try:
         response = SESSION.get(url, timeout=10)
+        if response.status_code == 429:
+            print(f"  [429] Rate limit en get_circulations ({story_id}). Reintentando...")
+            time.sleep(2)
+            return get_circulations(story_id)
         response.raise_for_status()
         data = response.json()
         # normalize possible shapes: list of circulations or dict wrapper
@@ -102,9 +112,9 @@ def get_circulations(story_id):
 
 def decirculate_story(story_id, website_ids):
     """Paso 1: Elimina todas las circulaciones de una nota."""
-    print(f"-> Paso 1: Descirculando la nota de {len(website_ids)} sitio(s)...")
+    # print(f"-> Paso 1: Descirculando la nota de {len(website_ids)} sitio(s)...") # Verbose off
     if not website_ids:
-        print("  La nota no tiene circulaciones para eliminar.")
+        # print("  La nota no tiene circulaciones para eliminar.")
         return True
 
     all_successful = True
@@ -112,9 +122,14 @@ def decirculate_story(story_id, website_ids):
         url = f"{DRAFT_API_BASE_URL}/story/{story_id}/circulation/{website_id}"
         try:
             response = SESSION.delete(url, timeout=10)
+            if response.status_code == 429:
+                print(f"  [429] Rate limit en decirculate ({story_id}). Reintentando...")
+                time.sleep(2)
+                # Retry logic simple: reintentar la misma llamada
+                response = SESSION.delete(url, timeout=10)
+            
             response.raise_for_status()
-            print(f"  - Descirculada de '{website_id}' exitosamente.")
-            time.sleep(0.05) # Pausa reducida (Rate limit aumentado a 900)
+            # print(f"  - Descirculada de '{website_id}' exitosamente.")
         except requests.exceptions.RequestException as e:
             print(f"  ERROR al descircular de '{website_id}': {e}")
             all_successful = False
@@ -122,16 +137,21 @@ def decirculate_story(story_id, website_ids):
 
 def unpublish_story(story_id):
     """Paso 2: Despublica la nota, eliminando su revisión publicada."""
-    print("-> Paso 2: Despublicando la nota...")
+    # print("-> Paso 2: Despublicando la nota...")
     url = f"{DRAFT_API_BASE_URL}/story/{story_id}/revision/published"
     try:
         response = SESSION.delete(url, timeout=10)
+        if response.status_code == 429:
+            print(f"  [429] Rate limit en unpublish ({story_id}). Reintentando...")
+            time.sleep(2)
+            return unpublish_story(story_id)
+
         # Una respuesta 404 (No Encontrado) es aceptable aquí, significa que ya no estaba publicada.
         if response.status_code == 404:
-            print("  La nota no tenía una revisión publicada activa (lo cual es correcto).")
+            # print("  La nota no tenía una revisión publicada activa (lo cual es correcto).")
             return True
         response.raise_for_status()
-        print("  - Nota despublicada exitosamente.")
+        # print("  - Nota despublicada exitosamente.")
         return True
     except requests.exceptions.RequestException as e:
         print(f"  ERROR al despublicar la nota: {e}")
@@ -139,12 +159,17 @@ def unpublish_story(story_id):
 
 def delete_story_permanently(story_id):
     """Paso 4: Borra la nota de forma definitiva e irreversible."""
-    print("-> Paso 4: Borrando la nota permanentemente...")
+    # print("-> Paso 4: Borrando la nota permanentemente...")
     url = f"{DRAFT_API_BASE_URL}/story/{story_id}"
     try:
         response = SESSION.delete(url, timeout=10)
+        if response.status_code == 429:
+            print(f"  [429] Rate limit en delete ({story_id}). Reintentando...")
+            time.sleep(2)
+            return delete_story_permanently(story_id)
+
         response.raise_for_status()
-        print("  - ¡ÉXITO! Nota borrada permanentemente de Arc XP.")
+        # print("  - ¡ÉXITO! Nota borrada permanentemente de Arc XP.")
         return True
     except requests.exceptions.RequestException as e:
         print(f"  ERROR al borrar la nota permanentemente: {e}")
@@ -154,29 +179,30 @@ def process_story_for_deletion(story_id):
     """
     Ejecuta la secuencia completa de borrado para un ID de nota.
     """
-    print(f"\n--- INICIANDO PROCESO DE BORRADO PARA NOTA: {story_id} ---")
+    # print(f"\n--- INICIANDO PROCESO DE BORRADO PARA NOTA: {story_id} ---")
 
     # PASO 1: DESCIRCULAR
     website_ids = get_circulations(story_id)
     if website_ids is None:
-        print("  No se pudo continuar. Error al obtener las circulaciones.")
+        print(f"  [{story_id}] Error al obtener las circulaciones.")
         return
 
     if not decirculate_story(story_id, website_ids):
-        print("  FALLO en el paso de descirculación. Abortando el proceso para esta nota.")
+        print(f"  [{story_id}] FALLO en descirculación.")
         return
 
     # PASO 2: DESPUBLICAR
     if not unpublish_story(story_id):
-        print("  FALLO en el paso de despublicación. Abortando el proceso para esta nota.")
+        print(f"  [{story_id}] FALLO en despublicación.")
         return
 
-    # PASO 3: URL CANÓNICA (se elimina automáticamente con el paso 1)
-    print("-> Paso 3: La URL canónica se elimina con la descirculación (completado).")
-
     # PASO 4: BORRADO PERMANENTE
-    delete_story_permanently(story_id)
-    print(f"--- Proceso para la nota {story_id} finalizado. ---")
+    if delete_story_permanently(story_id):
+        # Solo imprimimos éxito final para reducir ruido en consola
+        # print(f"[{story_id}] Borrada OK")
+        pass
+    else:
+        print(f"[{story_id}] FALLO en borrado permanente.")
 
 
 if __name__ == "__main__":
@@ -225,9 +251,41 @@ if __name__ == "__main__":
 
         print(f"Se van a procesar {len(story_ids)} notas.")
 
-        for sid in story_ids:
-            process_story_for_deletion(sid)
-            time.sleep(0.1) # Pausa reducida entre notas
+        # Ejecución concurrente con ThreadPoolExecutor
+        print(f"Iniciando procesamiento concurrente con {MAX_WORKERS} hilos...")
+        start_time = time.time()
+        processed_count = 0
+
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Enviamos todas las tareas al pool
+            futures = {executor.submit(process_story_for_deletion, sid): sid for sid in story_ids}
+            
+            for future in as_completed(futures):
+                sid = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    print(f"Excepción generada para la nota {sid}: {exc}")
+                
+                processed_count += 1
+                
+                # Control de Rate Limit Global (Token Bucket simplificado)
+                # Calculamos el tiempo esperado para 'processed_count' items
+                expected_duration = processed_count * DELAY_PER_REQUEST # Aproximación burda por nota
+                # Mejor aproximación: dormir un poco si vamos muy rápido
+                # Pero con requests síncronos dentro de hilos, el cuello de botella suele ser la red.
+                # Si queremos ser estrictos con 950 req/min, y cada nota hace ~3 requests:
+                # 950 req/min / 3 req/nota ~= 316 notas/min ~= 5.2 notas/seg
+                
+                # Simplemente imprimimos progreso cada 100 notas
+                if processed_count % 100 == 0:
+                    elapsed = time.time() - start_time
+                    rate = processed_count / elapsed
+                    print(f"Procesadas {processed_count}/{len(story_ids)} notas. Velocidad actual: {rate:.2f} notas/seg")
+
+        total_time = time.time() - start_time
+        print(f"\nProcesamiento finalizado en {total_time:.2f} segundos.")
+        print(f"Velocidad promedio: {len(story_ids)/total_time:.2f} notas/segundo.")
 
     except FileNotFoundError as fe:
         print(f"Error: archivo no encontrado: {fe}")
