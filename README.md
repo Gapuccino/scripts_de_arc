@@ -27,6 +27,17 @@ Ejecutar auditoría (ejemplo):
 Ejecutar pipeline en prueba:
    python .\pipeline_notas.py --csv .\reports_fotos\fayerwayer\notas_publicadas_fayerwayer_2021.csv --limit 5
 
+Ejecutar Borrado Masivo (Todos los sitios):
+   # Este comando procesa todos los CSVs en reports_fotos de forma secuencial
+   Get-ChildItem -Directory .\reports_fotos | ForEach-Object {
+       $site = $_.Name
+       Get-ChildItem -Path ".\reports_fotos\$site\notas_publicadas_$site_*.csv" -ErrorAction SilentlyContinue | ForEach-Object {
+           Write-Host ">>> Procesando $($_.Name) a máxima velocidad..." -ForegroundColor Green
+           python .\pipeline_notas.py --csv $_.FullName
+           Start-Sleep -Milliseconds 500
+       }
+   }
+
 Subir a GitHub (resumen):
 1) Crear repo en GitHub (web o 'gh repo create')
 2) Inicializar git, añadir y commitear:
