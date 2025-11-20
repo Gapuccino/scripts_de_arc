@@ -22,6 +22,7 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "Authorization": f"Bearer {ARC_ACCESS_TOKEN}",
     "Content-Type": "application/json",
+    "Arc-Priority": "ingestion",  # Header para contenido histórico/migrado
 })
 
 
@@ -113,7 +114,7 @@ def decirculate_story(story_id, website_ids):
             response = SESSION.delete(url, timeout=10)
             response.raise_for_status()
             print(f"  - Descirculada de '{website_id}' exitosamente.")
-            time.sleep(0.5) # Pausa para no saturar la API
+            time.sleep(0.05) # Pausa reducida (Rate limit aumentado a 900)
         except requests.exceptions.RequestException as e:
             print(f"  ERROR al descircular de '{website_id}': {e}")
             all_successful = False
@@ -226,7 +227,7 @@ if __name__ == "__main__":
 
         for sid in story_ids:
             process_story_for_deletion(sid)
-            time.sleep(1)
+            time.sleep(0.1) # Pausa reducida entre notas
 
     except FileNotFoundError as fe:
         print(f"Error: archivo no encontrado: {fe}")
